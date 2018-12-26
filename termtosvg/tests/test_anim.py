@@ -197,6 +197,8 @@ class TestAnim(unittest.TestCase):
         template = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
         _, filename = tempfile.mkstemp(prefix='termtosvg_', suffix='.svg')
         anim.render_animation(records, filename, template)
+        with open(filename) as f:
+            anim.validate_svg(f)
 
     def test__render_still_frames(self):
         records = [
@@ -212,8 +214,11 @@ class TestAnim(unittest.TestCase):
         ]
 
         template = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
-        directory = tempfile.mkdtemp(prefix='termtosvg_test__render_still_frames')
-        anim.render_still_frames(records, directory, template)
+        grouped_records, root = anim._render_preparation(records, template, 9, 17)
+        frame_generator = anim._render_still_frames(grouped_records, root, 9, 17)
+
+        for frame in frame_generator:
+            anim.validate_svg(io.BytesIO(etree.tostring(frame)))
 
     def test__embed_css(self):
         data = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
@@ -222,3 +227,24 @@ class TestAnim(unittest.TestCase):
             root = tree.getroot()
             anim._embed_css(root, animation_duration)
             assert b'{{' not in etree.tostring(root)
+
+    def test_validate_svg(self):
+        failure_test_cases = [
+            '',
+            '<svg>',
+            '</svg>',
+            '</svg></a>',
+            None
+        ]
+        for case in failure_test_cases:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    anim.validate_svg(io.StringIO(case))
+
+        success_test_cases = [
+            pkgutil.get_data('termtosvg', '/data/templates/gjm8.svg'),
+        ]
+        for bytes_svg in success_test_cases:
+            with io.BytesIO(bytes_svg) as bstream:
+                anim.validate_svg(bstream)
+

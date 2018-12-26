@@ -1,6 +1,7 @@
 import copy
 import io
 import pathlib
+import pkgutil
 from collections import namedtuple
 from itertools import groupby
 from typing import Iterator
@@ -37,9 +38,14 @@ CELL_HEIGHT = 17
 
 # XML namespaces
 SVG_NS = 'http://www.w3.org/2000/svg'
-XLINK_NS = 'http://www.w3.org/1999/xlink'
 TERMTOSVG_NS = 'https://github.com/nbedos/termtosvg'
+XLINK_NS = 'http://www.w3.org/1999/xlink'
 
+NAMESPACES = {
+    'svg': SVG_NS,
+    'termtosvg': TERMTOSVG_NS,
+    'xlink': XLINK_NS,
+}
 
 class TemplateError(Exception):
     pass
@@ -514,3 +520,26 @@ def _embed_css(root, animation_duration=None):
         style.text = etree.CDATA(css_header + css_body)
 
     return root
+
+
+def validate_svg(svg_file):
+    """Validate an SVG file against SVG 1.1 Document Type Definition"""
+    package = __name__.split('.')[0]
+    dtd_bytes = pkgutil.get_data(package, '/data/svg11-flat-20110816.dtd')
+    with io.BytesIO(dtd_bytes) as bstream:
+        dtd = etree.DTD(bstream)
+
+    try:
+        tree = etree.parse(svg_file)
+        for bad in tree.xpath('/svg:svg/svg:defs/termtosvg:template_settings',
+                              namespaces=NAMESPACES):
+            bad.getparent().remove(bad)
+        root = tree.getroot()
+        is_valid = dtd.validate(root)
+    except etree.Error as exc:
+        raise ValueError('Invalid SVG file') from exc
+
+    if not is_valid:
+        reason = dtd.error_log.filter_from_errors()[0]
+        raise ValueError('Invalid SVG file: {}'.format(reason))
+
