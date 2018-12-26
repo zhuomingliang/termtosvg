@@ -10,6 +10,14 @@ from lxml import etree
 from termtosvg import anim
 
 
+def line(i):
+    chars = []
+    for c in 'line{}'.format(i):
+        chars.append(anim.CharacterCell(c, '#123456', '#789012',
+                                        False, False, False, False))
+    return dict(enumerate(chars))
+
+
 class TestAnim(unittest.TestCase):
     def test_from_pyte(self):
         pyte_chars = [
@@ -157,13 +165,6 @@ class TestAnim(unittest.TestCase):
                 self.assertEqual(key(case), result)
 
     def test_make_animated_group(self):
-        def line(i):
-            chars = []
-            for c in 'line{}'.format(i):
-                chars.append(anim.CharacterCell(c, '#123456', '#789012',
-                                                False, False, False, False))
-            return dict(enumerate(chars))
-
         records = [
             anim.CharacterCellLineEvent(1, line(1), None, None),
             anim.CharacterCellLineEvent(2, line(2), None, None),
@@ -173,21 +174,15 @@ class TestAnim(unittest.TestCase):
             anim.CharacterCellLineEvent(5, line(4), None, None),
         ]
 
-        group, new_defs = anim.make_animated_group(records=records,
-                                                   time=10,
-                                                   duration=1,
-                                                   cell_width=8,
-                                                   cell_height=17,
-                                                   defs={})
+        for time, duration in [(10, 1), (None, None)]:
+            group, new_defs = anim._make_frame_group(records=records,
+                                                     time=time,
+                                                     duration=duration,
+                                                     cell_width=8,
+                                                     cell_height=17,
+                                                     definitions={})
 
-    def test__render_animation(self):
-        def line(i):
-            chars = []
-            for c in 'line{}'.format(i):
-                chars.append(anim.CharacterCell(c, '#123456', '#789012',
-                                                False, False, False, False))
-            return dict(enumerate(chars))
-
+    def test_render_animation(self):
         records = [
             anim.CharacterCellConfig(80, 24),
             anim.CharacterCellLineEvent(1, line(1), 0, 60),
@@ -200,17 +195,30 @@ class TestAnim(unittest.TestCase):
             anim.CharacterCellLineEvent(5, line(6), 300, 60),
         ]
         template = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
-        svg_root = anim._render_animation(records, template, 8, 17)
-
         _, filename = tempfile.mkstemp(prefix='termtosvg_', suffix='.svg')
-        with open(filename, 'wb') as f:
-            f.write(etree.tostring(svg_root))
+        anim.render_animation(records, filename, template)
 
-    def test_add_css_variables(self):
+    def test__render_still_frames(self):
+        records = [
+            anim.CharacterCellConfig(80, 24),
+            anim.CharacterCellLineEvent(1, line(1), 0, 60),
+            anim.CharacterCellLineEvent(2, line(2), 60, 60),
+            anim.CharacterCellLineEvent(3, line(3), 120, 60),
+            anim.CharacterCellLineEvent(4, line(4), 180, 60),
+            # Definition reuse
+            anim.CharacterCellLineEvent(5, line(4), 240, 60),
+            # Override line for animation chaining
+            anim.CharacterCellLineEvent(5, line(6), 300, 60),
+        ]
+
+        template = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
+        directory = tempfile.mkdtemp(prefix='termtosvg_test__render_still_frames')
+        anim.render_still_frames(records, directory, template)
+
+    def test__embed_css(self):
         data = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
-
-        tree = etree.parse(io.BytesIO(data))
-        root = tree.getroot()
-        anim.generate_css(root, 42)
-
-
+        for animation_duration in [None, 42]:
+            tree = etree.parse(io.BytesIO(data))
+            root = tree.getroot()
+            anim._embed_css(root, animation_duration)
+            assert b'{{' not in etree.tostring(root)

@@ -1,4 +1,6 @@
+import copy
 import io
+import pathlib
 from collections import namedtuple
 from itertools import groupby
 from typing import Iterator
@@ -18,6 +20,20 @@ pyte.graphics.FG_BG_256 = NAMED_COLORS + pyte.graphics.FG_BG_256[16:]
 # Id for the very last SVG animation. This is used to make the first animations start when the
 # last one ends (animation looping)
 LAST_ANIMATION_ID = 'anim_last'
+
+# Background rectangle SVG element
+_BG_RECT_TAG_ATTRIBUTES = {
+    'class': 'background',
+    'height': '100%',
+    'width': '100%',
+    'x': '0',
+    'y': '0'
+}
+BG_RECT_TAG = etree.Element('rect', _BG_RECT_TAG_ATTRIBUTES)
+
+# Default size for a character cell rendered as SVG.
+CELL_WIDTH = 8
+CELL_HEIGHT = 17
 
 # XML namespaces
 SVG_NS = 'http://www.w3.org/2000/svg'
@@ -109,7 +125,194 @@ class ConsecutiveWithSameAttributes:
         return self.group_index, key_attributes
 
 
-def make_rect_tag(column, length, height, cell_width, cell_height, background_color):
+def render_animation(records, filename, template, cell_width=CELL_WIDTH, cell_height=CELL_HEIGHT):
+    grouped_records, root = _render_preparation(records, template, cell_width, cell_height)
+    root = _render_animation(grouped_records, root, cell_width, cell_height)
+    with open(filename, 'wb') as output_file:
+        output_file.write(etree.tostring(root))
+
+
+def render_still_frames(records, directory, template, cell_width=CELL_WIDTH, cell_height=CELL_HEIGHT):
+    grouped_records, root = _render_preparation(records, template, cell_width, cell_height)
+    if not isinstance(directory, pathlib.PurePath):
+        directory = pathlib.Path(directory)
+
+    frame_generator = _render_still_frames(grouped_records, root, cell_width, cell_height)
+    for frame_count, frame_root in enumerate(frame_generator):
+        filename = directory / 'termtosvg_{:05}.svg'.format(frame_count)
+        with open(filename, 'wb') as output_file:
+            output_file.write(etree.tostring(frame_root))
+
+
+def _render_preparation(records, template, cell_width, cell_height):
+    # Read header record and add the corresponding information to the SVG
+    if not isinstance(records, Iterator):
+        records = iter(records)
+    header = next(records)
+    assert isinstance(header, CharacterCellConfig)
+
+    root = resize_template(template, header.width, header.height, cell_width, cell_height)
+
+    svg_screen_tag = root.find('.//{{{namespace}}}svg[@id="screen"]'.format(namespace=SVG_NS))
+    if svg_screen_tag is None:
+        raise ValueError('Missing tag: <svg id="screen" ...>...</svg>')
+
+    for child in svg_screen_tag.getchildren():
+        svg_screen_tag.remove(child)
+
+    svg_screen_tag.append(BG_RECT_TAG)
+
+    grouped_records = groupby(records, key=lambda r: (r.time, r.duration))
+
+    return grouped_records, root
+
+
+def _render_still_frames(grouped_records, root, cell_width, cell_height):
+    screen = {}
+    for _, record_group in grouped_records:
+        for record in record_group:
+            screen[record.row] = record
+
+        frame_group, frame_definitions = _make_frame_group(records=screen.values(),
+                                                           time=None,
+                                                           duration=None,
+                                                           cell_height=cell_height,
+                                                           cell_width=cell_width,
+                                                           definitions={})
+        frame_root = copy.deepcopy(root)
+        svg_screen_tag = root.find('.//{{{namespace}}}svg[@id="screen"]'.format(namespace=SVG_NS))
+        if svg_screen_tag is None:
+            raise ValueError('Missing tag: <svg id="screen" ...>...</svg>')
+        tree_defs = etree.SubElement(svg_screen_tag, 'defs')
+        for definition in frame_definitions.values():
+            tree_defs.append(definition)
+        svg_screen_tag.append(frame_group)
+
+        _embed_css(frame_root)
+        yield frame_root
+
+
+def _render_animation(grouped_records, root, cell_width, cell_height):
+    svg_screen_tag = root.find('.//{{{namespace}}}svg[@id="screen"]'.format(namespace=SVG_NS))
+    if svg_screen_tag is None:
+        raise ValueError('Missing tag: <svg id="screen" ...>...</svg>')
+
+    definitions = {}
+    last_animated_group = None
+    animation_duration = None
+    for (line_time, line_duration), record_group in grouped_records:
+        animated_group, group_definitions = _make_frame_group(records=record_group,
+                                                              time=line_time,
+                                                              duration=line_duration,
+                                                              cell_height=cell_height,
+                                                              cell_width=cell_width,
+                                                              definitions=definitions)
+
+        svg_screen_tag.append(animated_group)
+        last_animated_group = animated_group
+        animation_duration = line_time + line_duration
+        definitions.update(group_definitions)
+
+    tree_defs = etree.SubElement(svg_screen_tag, 'defs')
+    for definition in definitions.values():
+        tree_defs.append(definition)
+
+    # Add id attribute to the last 'animate' tag so that it can be referred to by the first
+    # animations (enables animation looping)
+    if last_animated_group is not None:
+        animate_tags = last_animated_group.findall('animate')
+        assert len(animate_tags) == 1
+        animate_tags.pop().attrib['id'] = LAST_ANIMATION_ID
+
+    _embed_css(root, animation_duration)
+    return root
+
+
+def _make_frame_group(records, time, duration, cell_height, cell_width, definitions):
+    """Return a group element containing an SVG version of the provided records. This group is
+    animated, that is to say displayed then removed according to the timing arguments.
+
+    :param records: List of lines that should be included in the group
+    :param time: Time the group should appear on the screen (milliseconds)
+    :param duration: Duration of the appearance on the screen (milliseconds)
+    :param cell_height: Height of a character cell in pixels
+    :param cell_width: Width of a character cell in pixels
+    :param definitions: Existing definitions (updated in place)
+    :return: A tuple consisting of the animated group and the new definitions
+    """
+    if time is None:
+        frame_group_tag = etree.Element('g')
+    else:
+        frame_group_tag = etree.Element('g', attrib={'display': 'none'})
+
+    group_definitions = {}
+    for line_event in records:
+        tags, new_definitions = _render_line_event(record=line_event,
+                                                   cell_height=cell_height,
+                                                   cell_width=cell_width,
+                                                   definitions={**definitions, **group_definitions})
+        for tag in tags:
+            frame_group_tag.append(tag)
+        group_definitions.update(new_definitions)
+
+    # Finally, add an animation tag so that the whole group goes from 'display: none' to
+    # 'display: inline' at the time the line should appear on the screen
+    if time is not None:
+        if time == 0:
+            # Animations starting at 0ms should also start when the last animation ends (looping)
+            begin_time = '0ms; {id}.end'.format(id=LAST_ANIMATION_ID)
+        else:
+            begin_time = '{time}ms; {id}.end+{time}ms'.format(time=time, id=LAST_ANIMATION_ID)
+        attributes = {
+            'attributeName': 'display',
+            'from': 'inline',
+            'to': 'inline',
+            'begin': begin_time,
+            'dur': '{}ms'.format(duration)
+        }
+
+        animation = etree.Element('animate', attributes)
+        frame_group_tag.append(animation)
+
+    return frame_group_tag, group_definitions
+
+
+def _render_line_event(record, cell_height, cell_width, definitions):
+    assert isinstance(record, CharacterCellLineEvent)
+
+    tags = _render_line_bg_colors(screen_line=record.line,
+                                  height=record.row * cell_height,
+                                  cell_height=cell_height,
+                                  cell_width=cell_width)
+
+    # Group text elements for the current line into text_group_tag
+    text_group_tag = etree.Element('g')
+    text_tags = _render_characters(record.line, cell_width)
+    for tag in text_tags:
+        text_group_tag.append(tag)
+
+    # Find or create a definition for text_group_tag
+    text_group_tag_str = etree.tostring(text_group_tag)
+    if text_group_tag_str in definitions:
+        group_id = definitions[text_group_tag_str].attrib['id']
+        new_definitions = {}
+    else:
+        group_id = 'g{}'.format(len(definitions) + + 1)
+        assert group_id not in definitions.values()
+        text_group_tag.attrib['id'] = group_id
+        new_definitions = {text_group_tag_str: text_group_tag}
+
+    # Add a reference to the definition of text_group_tag with a 'use' tag
+    use_attributes = {
+        '{{{namespace}}}href'.format(namespace=XLINK_NS): '#{_id}'.format(_id=group_id),
+        'y': str(record.row * cell_height),
+    }
+    tags.append(etree.Element('use', use_attributes))
+
+    return tags, new_definitions
+
+
+def _make_rect_tag(column, length, height, cell_width, cell_height, background_color):
     attributes = {
         'x': str(column * cell_width),
         'y': str(height),
@@ -142,14 +345,14 @@ def _render_line_bg_colors(screen_line, height, cell_height, cell_width):
                             if cell.background_color != 'background']
 
     key = ConsecutiveWithSameAttributes(['background_color'])
-    rect_tags = [make_rect_tag(column, len(list(group)), height, cell_width, cell_height,
-                               attributes['background_color'])
+    rect_tags = [_make_rect_tag(column, len(list(group)), height, cell_width, cell_height,
+                                attributes['background_color'])
                  for (column, attributes), group in groupby(non_default_bg_cells, key)]
 
     return rect_tags
 
 
-def make_text_tag(column, attributes, text, cell_width):
+def _make_text_tag(column, attributes, text, cell_width):
     """Build SVG text element based on content and style attributes"""
     text_tag_attributes = {
         'x': str(column * cell_width),
@@ -190,96 +393,10 @@ def _render_characters(screen_line, cell_width):
     """
     line = sorted(screen_line.items())
     key = ConsecutiveWithSameAttributes(['color', 'bold', 'italics', 'underscore', 'strikethrough'])
-    text_tags = [make_text_tag(column, attributes, ''.join(c.text for _, c in group), cell_width)
+    text_tags = [_make_text_tag(column, attributes, ''.join(c.text for _, c in group), cell_width)
                  for (column, attributes), group in groupby(line, key)]
 
     return text_tags
-
-
-_BG_RECT_TAG_ATTRIBUTES = {
-    'class': 'background',
-    'height': '100%',
-    'width': '100%',
-    'x': '0',
-    'y': '0'
-}
-BG_RECT_TAG = etree.Element('rect', _BG_RECT_TAG_ATTRIBUTES)
-
-
-def make_animated_group(records, time, duration, cell_height, cell_width, defs):
-    """Return a group element containing an SVG version of the provided records. This group is
-    animated, that is to say displayed then removed according to the timing arguments.
-
-    :param records: List of lines that should be included in the group
-    :param time: Time the group should appear on the screen (milliseconds)
-    :param duration: Duration of the appearance on the screen (milliseconds)
-    :param cell_height: Height of a character cell in pixels
-    :param cell_width: Width of a character cell in pixels
-    :param defs: Existing definitions
-    :return: A tuple consisting of the animated group and the new definitions
-    """
-    animation_group_tag = etree.Element('g', attrib={'display': 'none'})
-    new_definitions = {}
-    for event_record in records:
-        # Background elements
-        rect_tags = _render_line_bg_colors(screen_line=event_record.line,
-                                           height=event_record.row * cell_height,
-                                           cell_height=cell_height,
-                                           cell_width=cell_width)
-        for tag in rect_tags:
-            animation_group_tag.append(tag)
-
-        # Group text elements for the current line into text_group_tag
-        text_group_tag = etree.Element('g')
-        text_tags = _render_characters(event_record.line, cell_width)
-        for tag in text_tags:
-            text_group_tag.append(tag)
-
-        # Find or create a definition for text_group_tag
-        text_group_tag_str = etree.tostring(text_group_tag)
-        if text_group_tag_str in defs:
-            group_id = defs[text_group_tag_str].attrib['id']
-        elif text_group_tag_str in new_definitions:
-            group_id = new_definitions[text_group_tag_str].attrib['id']
-        else:
-            group_id = 'g{}'.format(len(defs) + len(new_definitions) + 1)
-            assert group_id not in defs.values() and group_id not in new_definitions.values()
-            text_group_tag.attrib['id'] = group_id
-            new_definitions[text_group_tag_str] = text_group_tag
-
-        # Add a reference to the definition of text_group_tag with a 'use' tag
-        use_attributes = {
-            '{{{namespace}}}href'.format(namespace=XLINK_NS): '#{_id}'.format(_id=group_id),
-            'y': str(event_record.row * cell_height),
-        }
-        use_tag = etree.Element('use', use_attributes)
-        animation_group_tag.append(use_tag)
-
-    # Finally, add an animation tag so that the whole group goes from 'display: none' to
-    # 'display: inline' at the time the line should appear on the screen
-    if time == 0:
-        # Animations starting at 0ms should also start when the last animation ends (looping)
-        begin_time = '0ms; {id}.end'.format(id=LAST_ANIMATION_ID)
-    else:
-        begin_time = '{time}ms; {id}.end+{time}ms'.format(time=time, id=LAST_ANIMATION_ID)
-    attributes = {
-        'attributeName': 'display',
-        'from': 'inline',
-        'to': 'inline',
-        'begin': begin_time,
-        'dur': '{}ms'.format(duration)
-    }
-
-    animation = etree.Element('animate', attributes)
-    animation_group_tag.append(animation)
-
-    return animation_group_tag, new_definitions
-
-
-def render_animation(records, filename, template, cell_width=8, cell_height=17):
-    root = _render_animation(records, template, cell_width, cell_height)
-    with open(filename, 'wb') as output_file:
-        output_file.write(etree.tostring(root))
 
 
 def resize_template(template, columns, rows, cell_width, cell_height):
@@ -364,58 +481,7 @@ def validate_template(name, templates):
         raise TemplateError('Invalid template') from exc
 
 
-def _render_animation(records, template, cell_width, cell_height):
-    # Read header record and add the corresponding information to the SVG
-    if not isinstance(records, Iterator):
-        records = iter(records)
-    header = next(records)
-
-    root = resize_template(template, header.width, header.height, cell_width, cell_height)
-
-    svg_screen_tag = root.find('.//{{{namespace}}}svg[@id="screen"]'.format(namespace=SVG_NS))
-    if svg_screen_tag is None:
-        raise ValueError('Missing tag: <svg id="screen" ...>...</svg>')
-
-    for child in svg_screen_tag.getchildren():
-        svg_screen_tag.remove(child)
-
-    svg_screen_tag.append(BG_RECT_TAG)
-
-    # Process event records
-    def by_time(record):
-        return record.time, record.duration
-
-    definitions = {}
-    last_animated_group = None
-    animation_duration = None
-    for (line_time, line_duration), record_group in groupby(records, key=by_time):
-        animated_group, new_defs = make_animated_group(records=record_group,
-                                                       time=line_time,
-                                                       duration=line_duration,
-                                                       cell_height=cell_height,
-                                                       cell_width=cell_width,
-                                                       defs=definitions)
-        definitions.update(new_defs)
-        for definition in new_defs.values():
-            etree.SubElement(svg_screen_tag, 'defs').append(definition)
-
-        svg_screen_tag.append(animated_group)
-        last_animated_group = animated_group
-        animation_duration = line_time + line_duration
-
-    # Add id attribute to the last 'animate' tag so that it can be referred to by the first
-    # animations (enables animation looping)
-    if last_animated_group is not None:
-        animate_tags = last_animated_group.findall('animate')
-        assert len(animate_tags) == 1
-        animate_tags.pop().attrib['id'] = LAST_ANIMATION_ID
-
-    generate_css(root=root, animation_duration=animation_duration)
-    return root
-
-
-def generate_css(root, animation_duration):
-    """Build and embed CSS in SVG animation"""
+def _embed_css(root, animation_duration=None):
     try:
         style = root.find('.//{{{namespace}}}defs/{{{namespace}}}style[@id="generated-style"]'
                           .format(namespace=SVG_NS))
@@ -425,20 +491,26 @@ def generate_css(root, animation_duration):
     if style is None:
         raise TemplateError('Missing <style id="generated-style" ...> element in "defs"')
 
-    css = """:root {{
+    css_header = """:root {{
             --animation-duration: {animation_duration}ms;
         }}
-        
-        #screen {{
+
+    """.format(animation_duration=animation_duration)
+
+    css_body = """#screen {
                 font-family: 'DejaVu Sans Mono', monospace;
                 font-style: normal;
                 font-size: 14px;
-            }}
+            }
 
-        text {{
+        text {
             dominant-baseline: text-before-edge;
             white-space: pre;
-        }}""".format(animation_duration=animation_duration)
+        }"""
 
-    style.text = etree.CDATA(css)
+    if animation_duration is None:
+        style.text = etree.CDATA(css_body)
+    else:
+        style.text = etree.CDATA(css_header + css_body)
+
     return root
