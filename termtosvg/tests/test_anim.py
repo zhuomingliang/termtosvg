@@ -217,16 +217,18 @@ class TestAnim(unittest.TestCase):
         grouped_records, root = anim._render_preparation(records, template, 9, 17)
         frame_generator = anim._render_still_frames(grouped_records, root, 9, 17)
 
-        for frame in frame_generator:
-            anim.validate_svg(io.BytesIO(etree.tostring(frame)))
+        for count, frame in enumerate(frame_generator):
+            with self.subTest(case='Frame #{}'.format(count)):
+                anim.validate_svg(io.BytesIO(etree.tostring(frame)))
 
     def test__embed_css(self):
         data = pkgutil.get_data('termtosvg', '/data/templates/progress_bar.svg')
         for animation_duration in [None, 42]:
-            tree = etree.parse(io.BytesIO(data))
-            root = tree.getroot()
-            anim._embed_css(root, animation_duration)
-            assert b'{{' not in etree.tostring(root)
+            with self.subTest(case=animation_duration):
+                tree = etree.parse(io.BytesIO(data))
+                root = tree.getroot()
+                anim._embed_css(root, animation_duration)
+                assert b'{{' not in etree.tostring(root)
 
     def test_validate_svg(self):
         failure_test_cases = [
@@ -247,4 +249,9 @@ class TestAnim(unittest.TestCase):
         for bytes_svg in success_test_cases:
             with io.BytesIO(bytes_svg) as bstream:
                 anim.validate_svg(bstream)
+
+
+    def still(self):
+        data = pkgutil.get_data('termtosvg', '/data/termtosvg_feapnnnv.cast')
+        pass
 

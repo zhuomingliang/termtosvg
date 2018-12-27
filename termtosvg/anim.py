@@ -47,6 +47,7 @@ NAMESPACES = {
     'xlink': XLINK_NS,
 }
 
+
 class TemplateError(Exception):
     pass
 
@@ -175,10 +176,12 @@ def _render_preparation(records, template, cell_width, cell_height):
 
 def _render_still_frames(grouped_records, root, cell_width, cell_height):
     screen = {}
-    for _, record_group in grouped_records:
+    for (line_time, line_duration), record_group in grouped_records:
         for record in record_group:
             screen[record.row] = record
 
+        screen = {row: record for row, record in screen.items()
+                  if record.time + record.duration >= line_time}
         frame_group, frame_definitions = _make_frame_group(records=screen.values(),
                                                            time=None,
                                                            duration=None,
@@ -186,7 +189,8 @@ def _render_still_frames(grouped_records, root, cell_width, cell_height):
                                                            cell_width=cell_width,
                                                            definitions={})
         frame_root = copy.deepcopy(root)
-        svg_screen_tag = root.find('.//{{{namespace}}}svg[@id="screen"]'.format(namespace=SVG_NS))
+        svg_screen_tag = frame_root.find('.//{{{namespace}}}svg[@id="screen"]'
+                                         .format(namespace=SVG_NS))
         if svg_screen_tag is None:
             raise ValueError('Missing tag: <svg id="screen" ...>...</svg>')
         tree_defs = etree.SubElement(svg_screen_tag, 'defs')
