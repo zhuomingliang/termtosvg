@@ -112,6 +112,7 @@ class CharacterCell(_CharacterCell):
 CharacterCellConfig = namedtuple('CharacterCellConfig', ['width', 'height'])
 CharacterCellLineEvent = namedtuple('CharacterCellLineEvent', ['row', 'line', 'time', 'duration'])
 
+LineDisplayEvent = namedtuple('LineDisplayEvent', ['row', 'line', 'time', 'duration'])
 
 class ConsecutiveWithSameAttributes:
     """Callable to be used as a key for itertools.groupby to group together consecutive elements

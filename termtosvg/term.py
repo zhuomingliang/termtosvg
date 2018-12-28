@@ -13,7 +13,7 @@ from typing import Iterator
 import pyte
 import pyte.screens
 
-from termtosvg.anim import CharacterCellConfig, CharacterCellLineEvent
+from termtosvg.anim import CharacterCell, CharacterCellConfig, CharacterCellLineEvent
 from termtosvg.asciicast import AsciiCastV2Event, AsciiCastV2Header
 
 
@@ -192,6 +192,105 @@ def _group_by_time(event_records, min_rec_duration, max_rec_duration, last_rec_d
                                              event_data=current_string,
                                              duration=last_rec_duration / 1000)
         yield accumulator_event
+
+
+class TerminalSession:
+    def __init__(self, columns, lines):
+        self._lines_diplayed = {}
+        self._current_time = 0
+        self._last_cursor = None
+        self._screen = pyte.Screen(columns, lines)
+        self._stream = pyte.ByteStream(self._screen)
+
+    def _close(self):
+        pass
+
+    def events(self, records):
+        for record in records:
+            yield from self._feed_single(record)
+
+        yield from self._close()
+
+    def _buffer(self):
+        """Return a buffer representing the current state of the screen"""
+        rows_changed = set(self._screen.dirty)
+        if self._screen.cursor != self._last_cursor:
+            if not self._screen.cursor.hidden:
+                rows_changed.add(self._screen.cursor.y)
+            if self._last_cursor is not None and not self._last_cursor.hidden:
+                rows_changed.add(self._last_cursor.y)
+
+        redraw_buffer = {}
+        for row in rows_changed:
+            redraw_buffer[row] = {}
+            buffer_row = self._screen.buffer[row]
+            for column in buffer_row:
+                redraw_buffer[row][column] = CharacterCell.from_pyte(buffer_row[column])
+
+        if (self._screen.cursor != self._last_cursor and
+                not self._screen.cursor.hidden):
+            x, y = self._screen.cursor.y, self._screen.cursor.x
+            try:
+                data = self._screen.buffer[x][y].data
+            except KeyError:
+                data = ' '
+
+            cursor_char = pyte.screens.Char(data=data,
+                                            fg=self._screen.cursor.attrs.fg,
+                                            bg=self._screen.cursor.attrs.bg,
+                                            reverse=True)
+            redraw_buffer[x][y] = CharacterCell.from_pyte(cursor_char)
+
+        self._last_cursor = copy(self._screen.cursor)
+        self._screen.dirty.clear()
+
+        return redraw_buffer
+
+    def _feed_single(self, record):
+        """Update terminal session from asciicast V2 event record"""
+        def sort_by_time(d, row):
+            _, row_line_time, row_line_duration = d[row]
+            return row_line_time + row_line_duration, row
+
+        assert isinstance(record, AsciiCastV2Event)
+        self._stream.feed(record.event_data)
+        redraw_buffer = self._buffer()
+
+        # 
+        #
+        #
+        #
+        # completed_lines: Mapping row -> LineErase
+        completed_lines = {}
+        duration = int(1000 * record.duration)
+        # Possible events:
+        #    - new line display
+        #    - line changed
+        #    - line erased
+        for row in self._lines_diplayed:
+            line, line_time, line_duration = self._lines_diplayed[row]
+            if row in redraw_buffer:
+                completed_lines[row] = line, line_time, line_duration
+            else:
+                # Update line duration
+                self._lines_diplayed[row] = line, line_time, line_duration + duration
+
+        for row in redraw_buffer:
+            if redraw_buffer[row]:
+                # Event: new line displayed or old line updated
+                self._lines_diplayed[row] = redraw_buffer[row], self._current_time, duration
+            elif row in self._lines_diplayed:
+                # Event: end of display
+                del self._lines_diplayed[row]
+
+        for row in sorted(completed_lines, key=partial(sort_by_time, completed_lines)):
+            args = (row, *completed_lines[row])
+            # Event: End of line display
+            yield CharacterCellLineEvent(*args)
+
+            self._current_time += duration
+
+
 
 
 def replay(records, from_pyte_char, min_frame_duration, max_frame_duration, last_frame_duration=1000):
